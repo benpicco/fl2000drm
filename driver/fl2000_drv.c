@@ -919,28 +919,11 @@ static const struct drm_connector_funcs fl2000_connector_funcs = {
 
 DEFINE_DRM_GEM_FOPS(fl2000_fops);
 
-/*
- * PRIME imports (Xorg output slaving: i915 renders, we scan out) must be
- * DMA-mapped against the USB host controller — the USB interface device
- * itself has no dma_mask and the default import path WARNs and fails,
- * which leaves the slaved output permanently black.
- */
-static struct drm_gem_object *
-fl2000_gem_prime_import(struct drm_device *drm, struct dma_buf *dma_buf)
-{
-	struct fl2000 *fl = to_fl2000(drm);
-
-	if (!fl->dmadev)
-		return ERR_PTR(-ENODEV);
-	return drm_gem_prime_import_dev(drm, dma_buf, fl->dmadev);
-}
-
 static const struct drm_driver fl2000_drm_driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
 	.fops = &fl2000_fops,
 	DRM_GEM_SHMEM_DRIVER_OPS,
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
-	.gem_prime_import = fl2000_gem_prime_import,
 	.name = DRIVER_NAME,
 	.desc = "Fresco Logic FL2000 USB display",
 	.major = 1,
@@ -990,18 +973,6 @@ static int fl2000_probe(struct usb_interface *intf,
 				       fl->stream_wq);
 	if (ret)
 		return ret;
-
-	fl->dmadev = usb_intf_get_dma_device(intf);
-	if (fl->dmadev) {
-		ret = devm_add_action_or_reset(&intf->dev,
-					       (void (*)(void *))put_device,
-					       fl->dmadev);
-		if (ret)
-			return ret;
-	} else {
-		dev_warn(&intf->dev,
-			 "no DMA device, buffer sharing (PRIME) disabled\n");
-	}
 
 	/* streaming bulk endpoint lives on interface 0 altsetting 1 */
 	ret = usb_set_interface(udev, 0, 1);
