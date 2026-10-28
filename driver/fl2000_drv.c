@@ -79,6 +79,9 @@ MODULE_PARM_DESC(pace, "frame pacing: 0=off 1=frequency-locked to the chip's sca
 #define FL2000_BUDGET_USB3	400000000ULL
 /* above this RGB888 rate on USB3, fall back to RGB565 on the wire */
 #define FL2000_RGB888_LIMIT	320000000ULL
+#define FL2000_VGA_MONITOR_STATUS	BIT(29)
+#define FL2000_DDC_ADDR		0x50
+#define FL2000_DDC_SEGMENT_ADDR	0x30
 
 static u32 fl2000_wire_bpp_for(struct fl2000 *fl, const struct fl2000_mode *m)
 {
@@ -326,10 +329,46 @@ static void fl2000_stream_work(struct work_struct *work)
  *
  * Everything userspace can reach (detect/get_modes ioctls) is served from
  * cached state; the actual HPD and DDC traffic runs in status_work. A DDC
- * read is seconds in the best case and minutes when the ITE bus-hang
- * recovery kicks in — running it inside a connector ioctl blocks the X
- * server (single-threaded) and freezes the entire desktop.
+ * read is slow and can require bus-hang recovery — running it inside a
+ * connector ioctl blocks the X server (single-threaded).
  */
+
+static int fl2000_vga_read_edid_block(struct fl2000 *fl, u8 *buf,
+				      unsigned int block)
+{
+	u8 segment = block / 2;
+	u8 base = (block % 2) * 128;
+	int i, j, ret;
+
+	if (block >= ARRAY_SIZE(fl->edid_cache) / 128)
+		return -EINVAL;
+
+	/*
+	 * The FL2000 I2C engine always transfers four data bytes. Repeating
+	 * the segment value keeps the DDC segment pointer at the requested
+	 * value for all four bytes of the write.
+	 */
+	if (segment) {
+		u32 data = segment * 0x01010101;
+
+		ret = fl2000_i2c_write32(fl, FL2000_DDC_SEGMENT_ADDR,
+					 segment, data);
+		if (ret)
+			return ret;
+	}
+
+	for (i = 0; i < 128; i += sizeof(u32)) {
+		u32 data;
+
+		ret = fl2000_i2c_read32(fl, FL2000_DDC_ADDR, base + i, &data);
+		if (ret)
+			return ret;
+		for (j = 0; j < sizeof(data); j++)
+			buf[i + j] = data >> (j * 8);
+	}
+
+	return 0;
+}
 
 static void fl2000_refresh_edid_cache(struct fl2000 *fl)
 {
@@ -340,13 +379,22 @@ static void fl2000_refresh_edid_cache(struct fl2000 *fl)
 	fl->edid_valid = false;
 	mutex_unlock(&fl->edid_lock);
 
-	if (fl2000_ite_read_edid_block(fl, buf, 0, 128))
+	if (fl->ite_present) {
+		if (fl2000_ite_read_edid_block(fl, buf, 0, 128))
+			return;
+	} else if (fl2000_vga_read_edid_block(fl, buf, 0)) {
 		return;
+	}
 
 	blocks = min_t(int, buf[126], 3) + 1;
 	for (i = 1; i < blocks; i++) {
-		if (fl2000_ite_read_edid_block(fl, buf + i * 128, i, 128))
+		if (fl->ite_present) {
+			if (fl2000_ite_read_edid_block(fl, buf + i * 128,
+						       i, 128))
+				return;
+		} else if (fl2000_vga_read_edid_block(fl, buf + i * 128, i)) {
 			return;
+		}
 	}
 
 	mutex_lock(&fl->edid_lock);
@@ -362,12 +410,20 @@ static void fl2000_status_work(struct work_struct *work)
 {
 	struct fl2000 *fl = container_of(work, struct fl2000, status_work);
 	bool changed = false;
-	int hpd, idx;
+	u32 status;
+	int hpd, idx, ret;
 
 	if (!drm_dev_enter(&fl->drm, &idx))
 		return;
 
-	hpd = fl2000_ite_hpd(fl);
+	if (fl->ite_present) {
+		hpd = fl2000_ite_hpd(fl);
+	} else {
+		ret = fl2000_reg_read(fl, 0x8000, &status);
+		if (ret)
+			goto out;
+		hpd = !!(status & FL2000_VGA_MONITOR_STATUS);
+	}
 	if (hpd < 0)
 		goto out;
 
@@ -755,13 +811,10 @@ static int fl2000_connector_get_modes(struct drm_connector *connector)
 	const struct drm_edid *drm_edid = NULL;
 	int count;
 
-	if (fl->ite_present) {
-		mutex_lock(&fl->edid_lock);
-		if (fl->edid_valid)
-			drm_edid = drm_edid_alloc(fl->edid_cache,
-						  fl->edid_len);
-		mutex_unlock(&fl->edid_lock);
-	}
+	mutex_lock(&fl->edid_lock);
+	if (fl->edid_valid)
+		drm_edid = drm_edid_alloc(fl->edid_cache, fl->edid_len);
+	mutex_unlock(&fl->edid_lock);
 
 	drm_edid_connector_update(connector, drm_edid);
 
@@ -833,13 +886,10 @@ fl2000_connector_detect(struct drm_connector *connector, bool force)
 	struct fl2000 *fl = to_fl2000(connector->dev);
 	int idx;
 
-	if (!fl->ite_present)
-		return connector_status_connected;
-
 	/*
 	 * Cached state only — no USB traffic here. The worker re-reads HPD
-	 * and fires a hotplug event on change, so a stale answer lasts at
-	 * most one poll period.
+	 * (ITE HPD or native VGA monitor status) and fires a hotplug event
+	 * on change, so a stale answer lasts at most one poll period.
 	 */
 	if (drm_dev_enter(&fl->drm, &idx)) {
 		queue_work(system_unbound_wq, &fl->status_work);
