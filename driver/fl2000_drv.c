@@ -18,6 +18,7 @@
 #include <linux/vmalloc.h>
 
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_cache.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
@@ -589,9 +590,13 @@ static void fl2000_free_frames(struct fl2000 *fl)
 		fl->xfers[i].urb = NULL;
 		fl->xfers[i].buf = NULL;
 	}
+	kfree(fl->read_buf);
+	vfree(fl->convert_buf);
 	vfree(fl->write_buf);
 	vfree(fl->ready_buf);
 	vfree(fl->send_buf);
+	fl->read_buf = NULL;
+	fl->convert_buf = NULL;
 	fl->write_buf = NULL;
 	fl->ready_buf = NULL;
 	fl->send_buf = NULL;
@@ -626,10 +631,13 @@ static void fl2000_pipe_enable(struct drm_simple_display_pipe *pipe,
 
 	fl->wire_bpp = fl2000_wire_bpp_for(fl, m);
 	fl->frame_len = (size_t)m->width * m->height * fl->wire_bpp;
+	fl->read_buf = kmalloc_objs(u32, ALIGN(m->width + 3, 4));
+	fl->convert_buf = vzalloc(fl->frame_len);
 	fl->write_buf = vzalloc(fl->frame_len);
 	fl->ready_buf = vzalloc(fl->frame_len);
 	fl->send_buf = vzalloc(fl->frame_len);
-	if (!fl->write_buf || !fl->ready_buf || !fl->send_buf)
+	if (!fl->read_buf || !fl->convert_buf || !fl->write_buf ||
+	    !fl->ready_buf || !fl->send_buf)
 		goto err_free;
 
 	sema_init(&fl->xfer_sem, FL2000_NUM_XFERS);
@@ -730,9 +738,14 @@ static void fl2000_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct drm_shadow_plane_state *shadow =
 		to_drm_shadow_plane_state(state);
 	struct drm_framebuffer *fb = state->fb;
-	struct drm_rect damage, full;
-	struct iosys_map dst;
-	int idx;
+	struct drm_framebuffer line_fb = {
+		.format = fb ? fb->format : NULL,
+	};
+	struct drm_rect damage, line;
+	struct iosys_map dst, src, read;
+	unsigned int dst_pitch;
+	size_t offset, read_len, aligned_len;
+	int idx, y;
 
 	if (!fb || !fl->write_buf || !fl->mode)
 		return;
@@ -742,24 +755,58 @@ static void fl2000_pipe_update(struct drm_simple_display_pipe *pipe,
 		return;
 
 	/*
-	 * Convert the full frame into write_buf (owned by the commit path,
-	 * commits are serialized by DRM), then publish it. Damage only
-	 * gates no-op commits for now.
+	 * Retain undamaged pixels in a commit-owned buffer: the rotating
+	 * streaming buffers may contain older frames. Only read damaged
+	 * pixels from the framebuffer, which can live in slow GPU memory.
 	 */
-	full = DRM_RECT_INIT(0, 0, fl->mode->width, fl->mode->height);
-	iosys_map_set_vaddr(&dst, fl->write_buf);
+	dst_pitch = fl->mode->width * fl->wire_bpp;
+	offset = (size_t)(damage.y1 - (state->src_y >> 16)) * dst_pitch +
+		 (damage.x1 - (state->src_x >> 16)) * fl->wire_bpp;
+	iosys_map_set_vaddr(&dst, fl->convert_buf + offset);
 
-	if (fl->wire_bpp == 2)
-		drm_fb_xrgb8888_to_rgb565(&dst, NULL, shadow->data, fb, &full,
-					  &shadow->fmtcnv_state);
-	else if (fl->wire_bpp == 4)
-		drm_fb_memcpy(&dst, NULL, shadow->data, fb, &full);
-	else if (fmt == 3)
-		drm_fb_xrgb8888_to_bgr888(&dst, NULL, shadow->data, fb, &full,
-					  &shadow->fmtcnv_state);
-	else
-		drm_fb_xrgb8888_to_rgb888(&dst, NULL, shadow->data, fb, &full,
-					  &shadow->fmtcnv_state);
+	/*
+	 * Read aligned chunks with DRM's WC-aware copy helper rather than
+	 * ordinary memcpy from GPU memory. The temporary framebuffer only
+	 * describes the cached scanline for the format conversion helpers.
+	 * Leave the tail unrounded so the final scanline is never overread.
+	 */
+	line.x1 = damage.x1 & 3;
+	line.y1 = 0;
+	line.x2 = line.x1 + drm_rect_width(&damage);
+	line.y2 = 1;
+	read_len = line.x2 * sizeof(u32);
+	aligned_len = round_down(read_len, 16);
+	line_fb.width = line.x2;
+	line_fb.height = 1;
+	line_fb.pitches[0] = read_len;
+	iosys_map_set_vaddr(&read, fl->read_buf);
+	src = shadow->data[0];
+	iosys_map_incr(&src, (size_t)damage.y1 * fb->pitches[0] +
+			     (damage.x1 - line.x1) * sizeof(u32));
+
+	for (y = damage.y1; y < damage.y2; y++) {
+		drm_memcpy_from_wc(&read, &src, aligned_len);
+		iosys_map_memcpy_from(fl->read_buf + aligned_len, &src,
+				      aligned_len, read_len - aligned_len);
+		if (fl->wire_bpp == 2)
+			drm_fb_xrgb8888_to_rgb565(&dst, &dst_pitch, &read,
+						  &line_fb, &line,
+						  &shadow->fmtcnv_state);
+		else if (fl->wire_bpp == 4)
+			drm_fb_memcpy(&dst, &dst_pitch, &read, &line_fb, &line);
+		else if (fmt == 3)
+			drm_fb_xrgb8888_to_bgr888(&dst, &dst_pitch, &read,
+						  &line_fb, &line,
+						  &shadow->fmtcnv_state);
+		else
+			drm_fb_xrgb8888_to_rgb888(&dst, &dst_pitch, &read,
+						  &line_fb, &line,
+						  &shadow->fmtcnv_state);
+		iosys_map_incr(&src, fb->pitches[0]);
+		iosys_map_incr(&dst, dst_pitch);
+	}
+
+	memcpy(fl->write_buf, fl->convert_buf, fl->frame_len);
 
 	/*
 	 * The FL2000 consumes the bulk stream as 64-bit words with the two

@@ -51,6 +51,8 @@ struct fl2000 {
 	 * ready_buf as send_buf. Neither side ever blocks on the other.
 	 */
 	spinlock_t frame_swap_lock;
+	void *read_buf;		/* aligned scanline staging for GPU memory */
+	void *convert_buf;	/* latest converted frame, before wire swapping */
 	void *write_buf;
 	void *ready_buf;
 	void *send_buf;
